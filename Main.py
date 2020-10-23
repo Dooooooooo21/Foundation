@@ -5,169 +5,223 @@
 # @File    : Main.py
 # @Desc    :
 
-import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
-from sklearn.preprocessing import LabelEncoder
-from sklearn.feature_selection import SelectKBest
-from lightgbm import LGBMRegressor
-import matplotlib.pyplot as plt
+import numpy as np
+import os
 import seaborn as sns
-import pandas_profiling
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn import metrics
+from sklearn.model_selection import KFold, train_test_split, cross_val_score
+import lightgbm as lgb
+from bayes_opt import BayesianOptimization
 
-# pd.options.display.max_columns = None
 
+# 调整数据类型，减少内存占用
+def reduce_mem_usage(df):
+    start_mem = df.memory_usage().sum() / 1024 ** 2
+    print('Memory usage of df is {:.2f} MB'.format(start_mem))
+
+    for col in df.columns:
+        col_type = df[col].dtype
+
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        else:
+            df[col] = df[col].astype('category')
+
+    end_mem = df.memory_usage().sum() / 1024 ** 2
+    print('Memory usage of df is {:.2f} MB'.format(end_mem))
+    print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+
+    return df
+
+
+# 读取数据
 data_path = 'C:/Users/Dooooooooo21/Desktop/project/FOUNDATION/'
-
 train_all = pd.read_csv(data_path + 'train.csv')
 test = pd.read_csv(data_path + 'testA.csv')
 
-print(f'There are {train_all.isnull().any().sum()} columns in train dataset with missing values.')
+train_all = reduce_mem_usage(train_all)
+test = reduce_mem_usage(test)
+
+y_train = train_all['isDefault']
+X_train = train_all.drop(['id', 'issueDate', 'isDefault', 'policyCode'], axis=1)
+X_test = test.drop(['id', 'issueDate', 'policyCode'], axis=1)
 
 
-# 查看缺失率大于 50% 的特征
-def fea_n_half():
-    have_null_fea_dict = (train_all.isnull().sum() / len(train_all)).to_dict()
-    fea_null_morethanhalf = {}
+def ori_lgb():
+    # 5折交叉验证
+    folds = 5
+    seed = 1001
+    kf = KFold(n_splits=folds, shuffle=True, random_state=seed)
 
-    for k, v in have_null_fea_dict.items():
-        if v > 0.5:
-            fea_null_morethanhalf[k] = v
+    cv_scores = []
 
-    print(fea_null_morethanhalf)
+    for i, (train_index, valid_index) in enumerate(kf.split(X_train, y_train)):
+        print('*' * 20 + str(i + 1) + '*' * 20)
+        X_train_split, X_val, y_train_split, y_val = train_test_split(X_train, y_train, test_size=0.2)
+        train_matrix = lgb.Dataset(X_train_split, label=y_train_split)
+        valid_matrix = lgb.Dataset(X_val, y_val)
 
+        params = {
+            'boosting_type': 'gbdt',
+            'objective': 'binary',
+            'metric': 'auc',
+            'learning_rate': 0.01,
+            'num_leaves': 14,
+            'max_depth': 19,
+            'min_data_in_leaf': 37,
+            'min_child_weight': 1.6,
+            'bagging_fraction': 0.98,
+            'feature_fraction': 0.69,
+            'bagging_freq': 96,
+            'reg_lambda': 9,
+            'reg_alpha': 7,
+            'min_split_gain': 0.4,
+            'nthread': 8,
+            'seed': 2020,
+        }
 
-# 查看缺失特征及缺失率
-def visual_fea_nul():
-    missing = train_all.isnull().sum() / len(train_all)
-    missing = missing[missing > 0]
-    missing.sort_values(inplace=True)
-    missing.plot.bar()
-    plt.show()
+        model = lgb.train(params, train_set=train_matrix, valid_sets=valid_matrix, num_boost_round=14269,
+                          verbose_eval=1000,
+                          early_stopping_rounds=200)
+        val_pre_lgb = model.predict(X_val, num_iteration=model.best_iteration)
+        cv_scores.append(metrics.roc_auc_score(y_val, val_pre_lgb))
 
+        print(cv_scores)
 
-# 查看单一值的特征
-one_value_fea = [col for col in train_all.columns if train_all[col].nunique() <= 1]
-
-# 区分数值型特征和类别特征
-
-numrical_fea = list(train_all.select_dtypes(exclude=['object']).columns)
-category_fea = list(filter(lambda x: x not in numrical_fea, list(train_all.columns)))
-
-
-# 数值型特征：离散型和连续型
-# 过滤数值型特征
-def get_numrical_serial_fea(data, feas):
-    numrical_serial_feas = []
-    numrical_noserial_feas = []
-
-    for fea in feas:
-        tmp = data[fea].nunique()
-        if tmp <= 10:
-            numrical_noserial_feas.append(fea)
-            continue
-        numrical_serial_feas.append(fea)
-
-    return numrical_serial_feas, numrical_noserial_feas
-
-
-numrical_serial_feas, numrical_noserial_feas = get_numrical_serial_fea(train_all, numrical_fea)
+    print("lgb_scotrainre_list:{}".format(cv_scores))
+    print("lgb_score_mean:{}".format(np.mean(cv_scores)))
+    print("lgb_score_std:{}".format(np.std(cv_scores)))
 
 
-# todo 离散型变量，相差悬殊的，再分析用不用
+def plot_roc(y_val, val_pre_lgb):
+    fpr, tpr, th = metrics.roc_curve(y_val, val_pre_lgb)
+    roc_auc = metrics.auc(fpr, tpr)
+    print('未调参lgb单模型在验证机上的AUC: {}'.format(roc_auc))
 
-
-# 连续型变量特征分布
-def numrical_serial():
-    f = pd.melt(train_all, value_vars='interestRate')
-    g = sns.FacetGrid(f, col='variable', col_wrap=2, sharex=False, sharey=False)
-    g = g.map(sns.distplot, 'value')
-    plt.show()
-
-
-# todo 查看变量是否符合正态分布，不符合的可以log后再观察是否符合正太分布
-# todo 正态可以让模型更快收敛，提高训练速度
-
-
-# 单一变量分布
-def single_fea():
+    # 画roc
     plt.figure(figsize=(8, 8))
-    sns.barplot(train_all['employmentLength'].value_counts(dropna=False),
-                train_all["employmentLength"].value_counts(dropna=False).keys())
+    plt.title('val roc')
+    plt.plot(fpr, tpr, 'b', label='Val auc = %0.4f' % roc_auc)
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.legend(loc='best')
+    plt.xlabel('false positive rate')
+    plt.ylabel('true positive rate')
+    # 画对角线
+    plt.plot([0, 1], [0, 1], 'r--')
     plt.show()
 
 
-# 数据报告
-# pf = pandas_profiling.ProfileReport(train_all)
-# pf.to_file('./report.html')
+def rf_cv_lgb(num_leaves, max_depth, bagging_fraction, feature_fraction, bagging_freq, min_data_in_leaf,
+              min_child_weight, min_split_gain, reg_lambda, reg_alpha):
+    model_lgb = lgb.LGBMClassifier(boosting_type='gbdt', objective='binary', metrics='auc', learning_rate=0.1,
+                                   n_estimators=5000, num_leaves=int(num_leaves), max_depth=int(max_depth),
+                                   bagging_fraction=round(bagging_fraction, 2),
+                                   feature_fraction=round(feature_fraction, 2),
+                                   bagging_freq=int(bagging_freq), min_data_in_leaf=int(min_data_in_leaf),
+                                   min_child_weight=min_child_weight, min_split_gain=min_split_gain,
+                                   reg_lambda=reg_lambda, reg_alpha=reg_alpha, n_jobs=8)
+    val = cross_val_score(model_lgb, X_train_split, y_train_split, cv=5, scoring='roc_auc').mean()
+
+    return val
 
 
-# 数据预处理：异常值、时间格式、对象类型转数值
-# 异常值处理：均方差、箱型图
-# 数据分箱
-# 特征交互
-# 特征编码
-# 特征选择
+# 贝叶斯调参
+def bayes():
+    bayes_lgb = BayesianOptimization(rf_cv_lgb, {
+        'num_leaves': (10, 200),
+        'max_depth': (3, 20),
+        'bagging_fraction': (0.5, 1.0),
+        'feature_fraction': (0.5, 1.0),
+        'bagging_freq': (0, 100),
+        'min_data_in_leaf': (10, 100),
+        'min_child_weight': (0, 10),
+        'min_split_gain': (0.0, 1.0),
+        'reg_alpha': (0.0, 10),
+        'reg_lambda': (0.0, 10),
+    })
+
+    bayes_lgb.maximize(n_iter=10)
+
+    # 最优参数
+    print(bayes_lgb.max)
 
 
-def employmentLength_to_int(s):
-    if pd.isnull(s):
-        return s
+# 确定最优的迭代次数
+def it():
+    base_params_lgb = {'boosting_type': 'gbdt',
+                       'objective': 'binary',
+                       'metric': 'auc',
+                       'learning_rate': 0.01,
+                       'num_leaves': 200,
+                       'max_depth': 3,
+                       'min_data_in_leaf': 56,
+                       'min_child_weight': 9.63,
+                       'bagging_fraction': 1.0,
+                       'feature_fraction': 1.0,
+                       'bagging_freq': 100,
+                       'reg_lambda': 10,
+                       'reg_alpha': 1,
+                       'min_split_gain': 1.0,
+                       'nthread': 8,
+                       'seed': 2020,
+                       'verbose': -1, }
 
-    return np.int8(s.split()[0])
+    cv_result_lgb = lgb.cv(train_set=train_matrix, early_stopping_rounds=1000, num_boost_round=20000, nfold=5,
+                           stratified=True, shuffle=True, params=base_params_lgb, metrics='auc', seed=0)
 
-
-for data in [train_all, test]:
-    data['employmentLength'].replace(to_replace='10+ years', value='10 years', inplace=True)
-    data['employmentLength'].replace(to_replace='< 1 year', value='0 years', inplace=True)
-    data['employmentLength'] = data['employmentLength'].apply(employmentLength_to_int)
-    data['earliesCreditLine'] = data['earliesCreditLine'].apply(lambda s: int(s[-4:]))
-    data['grade'] = data['grade'].map({'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7})
-    data = pd.get_dummies(data, columns=['subGrade', 'homeOwnership', 'verificationStatus', 'purpose', 'regionCode'],
-                          drop_first=True)
-
-print(data['employmentLength'].value_counts(dropna=False).sort_index())
-print(data['earliesCreditLine'].value_counts(dropna=False).sort_index())
-
-print(data.head())
-
-
-# 在统计学中，如果一个数据分布近似正态，那么大约 68% 的数据值会在均值的一个标准差范围内，
-# 大约 95% 会在两个标准差范围内，大约 99.7% 会在三个标准差范围内
-
-
-def find_outliers_by_3segama(data, fea):
-    data_std = np.std(data[fea])
-    data_mean = np.mean(data[fea])
-
-    outlier_cut_off = data_std * 3
-
-    lower = data_mean - outlier_cut_off
-    higher = data_mean + outlier_cut_off
-
-    data[fea + '_outliers'] = data[fea].apply(lambda x: str('异常值') if x > higher or x < lower else '正常值')
-
-    return data
+    print('迭代次数{}'.format(len(cv_result_lgb['auc-mean'])))
+    print('最终模型的AUC为{}'.format(max(cv_result_lgb['auc-mean'])))
 
 
-data_train = train_all.copy()
-for fea in numrical_fea:
-    data_train = find_outliers_by_3segama(data_train, fea)
-    print(data_train[fea + '_outliers'].value_counts())
-    print(data_train.groupby(fea + '_outliers')['isDefault'].sum())
-    print('*' * 10)
+# 最终训练模型
+X_train_split, X_val, y_train_split, y_val = train_test_split(X_train, y_train, test_size=0.2)
+train_matrix = lgb.Dataset(X_train_split, label=y_train_split)
+valid_matrix = lgb.Dataset(X_val, y_val)
 
-for col in tqdm(['employmentTitle', 'postCode', 'title', 'subGrade']):
-    le = LabelEncoder()
-    le.fit(list(data_train[col].astype(str).values) + list(test[col].astype(str).values))
-    data_train[col] = le.transform(list(data_train[col].astype(str).values))
-    test[col] = le.transform(list(test[col].astype(str).values))
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'metric': 'auc',
+    'learning_rate': 0.01,
+    'num_leaves': 14,
+    'max_depth': 19,
+    'min_data_in_leaf': 37,
+    'min_child_weight': 1.6,
+    'bagging_fraction': 0.98,
+    'feature_fraction': 0.69,
+    'bagging_freq': 96,
+    'reg_lambda': 9,
+    'reg_alpha': 7,
+    'min_split_gain': 0.4,
+    'nthread': 8,
+    'seed': 2020,
+}
 
-# todo 特征选择技术可以精简掉无用的特征，以降低最终模型的复杂性，它的最终目的是得到一个简约模型，
-#  在不降低预测准确率或对预测准确率影响不大的情况下提高计算速度。特征选择不是为了减少训练时间
-#  （实际上，一些技术会增加总体训练时间），而是为了减少模型评分时间
+model = lgb.train(params, train_set=train_matrix, num_boost_round=3300,
+                  verbose_eval=1000,
+                  valid_sets=valid_matrix,
+                  early_stopping_rounds=200)
+val_pre_lgb = model.predict(X_test, num_iteration=model.best_iteration)
 
-target = train_all.pop('isDefault')
-# fea_select = SelectKBest(k=5).fit_transform(train_all[numrical_serial_feas], target)
-# print(fea_select)
+# plot_roc(y_val, val_pre_lgb)
+pd.DataFrame(val_pre_lgb).to_csv('./result.csv')
